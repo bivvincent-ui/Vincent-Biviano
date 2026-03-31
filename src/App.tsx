@@ -1,448 +1,600 @@
 import { useEffect, useMemo, useState } from 'react';
+import { supabase } from './supabase';
+import type { Session } from '@supabase/supabase-js';
 
 type Profile = {
   id: string;
-  name: string;
-  age: number;
-  height: number;
-  bodyweight: number;
-  bestBench: number;
-  setWeight: number;
-  reps: number;
-  rpe: number;
-  goal: number;
-  benchDays: number;
-  grip: string;
-  stickingPoint: string;
+  user_id: string;
+  name: string | null;
+  age: number | null;
+  height: number | null;
+  bodyweight: number | null;
+  best_bench: number | null;
+  set_weight: number | null;
+  reps: number | null;
+  rpe: number | null;
+  goal: number | null;
+  bench_days: number | null;
+  grip: string | null;
+  sticking_point: string | null;
+  created_at: string;
 };
 
-const STORAGE_KEY = 'bench-ai-profiles';
-const ACTIVE_PROFILE_KEY = 'bench-ai-active-profile';
+type ProfileInput = Omit<Profile, 'id' | 'user_id' | 'created_at'>;
 
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
+const defaultProfile: ProfileInput = {
+  name: 'New Profile',
+  age: 18,
+  height: 180,
+  bodyweight: 80,
+  best_bench: 100,
+  set_weight: 80,
+  reps: 5,
+  rpe: 8,
+  goal: 110,
+  bench_days: 2,
+  grip: 'Medium',
+  sticking_point: 'Off Chest',
+};
+
+function round(num: number, places = 1) {
+  return Number(num.toFixed(places));
 }
 
-function roundTo(value: number, decimals = 1) {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
+function calculateEpley(weight: number, reps: number) {
+  return weight * (1 + reps / 30);
 }
 
-function estimate1RM(weight: number, reps: number, rpe: number) {
+function calculateBrzycki(weight: number, reps: number) {
+  if (reps >= 37) return weight;
+  return weight * (36 / (37 - reps));
+}
+
+function estimate1RM(weight: number, reps: number) {
   if (!weight || !reps) return 0;
-  const rir = Math.max(0, 10 - rpe);
-  const effectiveReps = reps + rir;
-  const epley = weight * (1 + effectiveReps / 30);
-  const brzycki = (weight * 36) / Math.max(1, 37 - effectiveReps);
-  return (epley + brzycki) / 2;
+  const epley = calculateEpley(weight, reps);
+  const brzycki = calculateBrzycki(weight, reps);
+  return round((epley + brzycki) / 2, 1);
 }
 
-function getLevel(ratio: number) {
-  if (ratio >= 2) return 'Elite';
-  if (ratio >= 1.75) return 'Advanced';
-  if (ratio >= 1.4) return 'Intermediate';
-  return 'Novice';
+function getStrengthLevel(oneRM: number, bodyweight: number) {
+  if (!oneRM || !bodyweight) return 'N/A';
+  const ratio = oneRM / bodyweight;
+
+  if (ratio < 0.8) return 'Novice';
+  if (ratio < 1.05) return 'Intermediate';
+  if (ratio < 1.35) return 'Advanced';
+  if (ratio < 1.7) return 'Elite';
+  return 'World Class';
 }
 
-function createBlankProfile(): Profile {
-  return {
-    id: crypto.randomUUID(),
-    name: 'New Person',
-    age: 20,
-    height: 182,
-    bodyweight: 93,
-    bestBench: 160,
-    setWeight: 140,
-    reps: 5,
-    rpe: 8,
-    goal: 170,
-    benchDays: 3,
-    grip: 'wide',
-    stickingPoint: 'lockout',
-  };
+function getWeakPoint(stickingPoint: string | null) {
+  switch (stickingPoint) {
+    case 'Off Chest':
+      return 'Likely pec / pause strength weakness. Add paused bench and Spoto press.';
+    case 'Mid Range':
+      return 'Likely overall pressing strength issue. Add close grip bench and pin press.';
+    case 'Lockout':
+      return 'Likely triceps weakness. Add board press, dips, and JM press.';
+    default:
+      return 'Choose a sticking point for tailored advice.';
+  }
 }
 
-export default function App() {
+function getProgram(oneRM: number) {
+  if (!oneRM) return [];
+
+  return [
+    {
+      week: 'Week 1',
+      day1: `${round(oneRM * 0.75)}kg x 5 x 5`,
+      day2: `${round(oneRM * 0.8)}kg x 4 x 4`,
+    },
+    {
+      week: 'Week 2',
+      day1: `${round(oneRM * 0.825)}kg x 4 x 3`,
+      day2: `${round(oneRM * 0.875)}kg x 3 x 2`,
+    },
+    {
+      week: 'Week 3',
+      day1: `${round(oneRM * 0.9)}kg x 2 x 2`,
+      day2: `${round(oneRM * 0.95)}kg x 1 x 1`,
+    },
+  ];
+}
+
+function App() {
+  const [session, setSession] = useState<Session | null>(null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [activeProfileId, setActiveProfileId] = useState<string>('');
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    const savedProfiles = localStorage.getItem(STORAGE_KEY);
-    const savedActiveProfile = localStorage.getItem(ACTIVE_PROFILE_KEY);
+    const getSession = async () => {
+      const {
+        data: { session },
+        error,
+      } = await supabase.auth.getSession();
 
-    if (savedProfiles) {
-      const parsed = JSON.parse(savedProfiles) as Profile[];
-      setProfiles(parsed);
+      console.log('GET SESSION:', session);
+      console.log('GET SESSION ERROR:', error);
 
-      if (savedActiveProfile && parsed.some((p) => p.id === savedActiveProfile)) {
-        setActiveProfileId(savedActiveProfile);
-      } else if (parsed.length > 0) {
-        setActiveProfileId(parsed[0].id);
-      }
-    } else {
-      const starter = createBlankProfile();
-      setProfiles([starter]);
-      setActiveProfileId(starter.id);
-    }
+      setSession(session);
+      setLoading(false);
+    };
+
+    getSession();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      console.log('AUTH EVENT:', event);
+      console.log('AUTH SESSION:', session);
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
   useEffect(() => {
-    if (profiles.length > 0) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(profiles));
-    }
-  }, [profiles]);
-
-  useEffect(() => {
-    if (activeProfileId) {
-      localStorage.setItem(ACTIVE_PROFILE_KEY, activeProfileId);
-    }
-  }, [activeProfileId]);
-
-  const activeProfile =
-    profiles.find((p) => p.id === activeProfileId) ?? profiles[0] ?? null;
-
-  function updateProfile<K extends keyof Profile>(key: K, value: Profile[K]) {
-    if (!activeProfile) return;
-    setProfiles((prev) =>
-      prev.map((p) => (p.id === activeProfile.id ? { ...p, [key]: value } : p))
-    );
-  }
-
-  function saveNewProfile() {
-    const newProfile = createBlankProfile();
-    setProfiles((prev) => [...prev, newProfile]);
-    setActiveProfileId(newProfile.id);
-  }
-
-  function duplicateProfile() {
-    if (!activeProfile) return;
-    const copied: Profile = {
-      ...activeProfile,
-      id: crypto.randomUUID(),
-      name: `${activeProfile.name} Copy`,
-    };
-    setProfiles((prev) => [...prev, copied]);
-    setActiveProfileId(copied.id);
-  }
-
-  function deleteProfile() {
-    if (!activeProfile) return;
-    if (profiles.length === 1) {
-      const fresh = createBlankProfile();
-      setProfiles([fresh]);
-      setActiveProfileId(fresh.id);
+    if (!session?.user) {
+      setProfiles([]);
+      setSelectedProfileId(null);
       return;
     }
 
-    const nextProfiles = profiles.filter((p) => p.id !== activeProfile.id);
-    setProfiles(nextProfiles);
-    setActiveProfileId(nextProfiles[0].id);
-  }
+    fetchProfiles();
+  }, [session]);
 
-  const analysis = useMemo(() => {
-    if (!activeProfile) return null;
+  const fetchProfiles = async () => {
+    if (!session?.user) return;
 
-    const e1rm = estimate1RM(
-      activeProfile.setWeight,
-      activeProfile.reps,
-      activeProfile.rpe
-    );
-    const chosenMax = roundTo(Math.max(activeProfile.bestBench, e1rm), 1);
-    const ratio = activeProfile.bodyweight
-      ? roundTo(chosenMax / activeProfile.bodyweight, 2)
-      : 0;
-    const level = getLevel(ratio);
-    const goalGap = roundTo(activeProfile.goal - chosenMax, 1);
-    const realism = clamp(roundTo(92 - Math.max(0, goalGap) * 5.5, 0), 15, 99);
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('user_id', session.user.id)
+      .order('created_at', { ascending: true });
 
-    let mainFeedback = '';
-    if (activeProfile.stickingPoint === 'lockout') {
-      mainFeedback =
-        'This person looks limited at lockout. Prioritise close-grip bench, triceps work, and overload partials.';
-    } else if (activeProfile.stickingPoint === 'off_chest') {
-      mainFeedback =
-        'This person looks limited off the chest. Prioritise paused bench, Spoto press, and staying tighter on the touch.';
-    } else {
-      mainFeedback =
-        'This person looks limited in mid-range. Prioritise bar path consistency, upper-back stability, and leg drive timing.';
+    if (error) {
+      console.error('Error loading profiles:', error);
+      return;
     }
 
-    const gripFeedback =
-      activeProfile.grip === 'wide'
-        ? 'Keep wide grip for heavy specificity, but use a slightly closer grip on secondary work.'
-        : 'Use competition grip on heavy work so strength carries over to max attempts.';
+    const loadedProfiles = (data ?? []) as Profile[];
+    setProfiles(loadedProfiles);
 
-    const program = [
-      {
-        week: 'Week 1',
-        lines: [
-          'Day 1: Heavy single @ 88–90%, then 4x3 @ 80–83%',
-          'Day 2: 5x5 @ 72–76%',
-          'Day 3: 8x3 speed bench @ 60–65%',
-        ],
-      },
-      {
-        week: 'Week 2',
-        lines: [
-          'Day 1: 3 singles @ 91–94%, then 3x2 @ 84–86%',
-          'Day 2: 4x4 @ 74–78%',
-          'Day 3: 6x3 speed bench + paused triples',
-        ],
-      },
-      {
-        week: 'Week 3',
-        lines: [
-          'Day 1: 90%, 94%, 97–100% if fast',
-          'Day 2: 3x3 @ 58–62%',
-          'Day 3: Test day / max attempt',
-        ],
-      },
-    ];
+    if (loadedProfiles.length > 0) {
+      setSelectedProfileId((current) =>
+        current && loadedProfiles.some((p) => p.id === current)
+          ? current
+          : loadedProfiles[0].id
+      );
+    } else {
+      const newId = await createProfile();
+      if (newId) setSelectedProfileId(newId);
+    }
+  };
 
-    return {
-      e1rm,
-      chosenMax,
-      ratio,
-      level,
-      goalGap,
-      realism,
-      mainFeedback,
-      gripFeedback,
-      program,
+  const selectedProfile = useMemo(
+    () => profiles.find((p) => p.id === selectedProfileId) ?? null,
+    [profiles, selectedProfileId]
+  );
+
+  const oneRM = useMemo(() => {
+    if (!selectedProfile) return 0;
+    const weight = Number(selectedProfile.set_weight ?? 0);
+    const reps = Number(selectedProfile.reps ?? 0);
+    return estimate1RM(weight, reps);
+  }, [selectedProfile]);
+
+  const strengthLevel = useMemo(() => {
+    if (!selectedProfile) return 'N/A';
+    return getStrengthLevel(oneRM, Number(selectedProfile.bodyweight ?? 0));
+  }, [selectedProfile, oneRM]);
+
+  const bodyweightRatio = useMemo(() => {
+    if (!selectedProfile?.bodyweight || !oneRM) return 0;
+    return round(oneRM / Number(selectedProfile.bodyweight), 2);
+  }, [selectedProfile, oneRM]);
+
+  const goalPercent = useMemo(() => {
+    if (!selectedProfile?.goal || !oneRM) return 0;
+    return round((oneRM / Number(selectedProfile.goal)) * 100, 1);
+  }, [selectedProfile, oneRM]);
+
+  const program = useMemo(() => getProgram(oneRM), [oneRM]);
+
+  const signInWithGoogle = async () => {
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+    });
+
+    if (error) {
+      console.error('Google login error:', error.message);
+    }
+  };
+
+  const signOut = async () => {
+    await supabase.auth.signOut();
+  };
+
+  const createProfile = async () => {
+    if (!session?.user) return null;
+
+    const payload = {
+      user_id: session.user.id,
+      ...defaultProfile,
+      name: `Profile ${profiles.length + 1}`,
     };
-  }, [activeProfile]);
 
-  if (!activeProfile || !analysis) {
-    return <div style={{ padding: 24 }}>Loading...</div>;
+    const { data, error } = await supabase
+      .from('profiles')
+      .insert(payload)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error creating profile:', error);
+      return null;
+    }
+
+    const newProfile = data as Profile;
+    setProfiles((prev) => [...prev, newProfile]);
+    setSelectedProfileId(newProfile.id);
+    return newProfile.id;
+  };
+
+  const duplicateProfile = async () => {
+    if (!session?.user || !selectedProfile) return;
+
+    const payload = {
+      user_id: session.user.id,
+      name: `${selectedProfile.name ?? 'Profile'} Copy`,
+      age: selectedProfile.age,
+      height: selectedProfile.height,
+      bodyweight: selectedProfile.bodyweight,
+      best_bench: selectedProfile.best_bench,
+      set_weight: selectedProfile.set_weight,
+      reps: selectedProfile.reps,
+      rpe: selectedProfile.rpe,
+      goal: selectedProfile.goal,
+      bench_days: selectedProfile.bench_days,
+      grip: selectedProfile.grip,
+      sticking_point: selectedProfile.sticking_point,
+    };
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .insert(payload)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error duplicating profile:', error);
+      return;
+    }
+
+    const newProfile = data as Profile;
+    setProfiles((prev) => [...prev, newProfile]);
+    setSelectedProfileId(newProfile.id);
+  };
+
+  const deleteProfile = async () => {
+    if (!selectedProfile) return;
+
+    const confirmDelete = window.confirm(
+      `Delete "${selectedProfile.name ?? 'this profile'}"?`
+    );
+    if (!confirmDelete) return;
+
+    const { error } = await supabase
+      .from('profiles')
+      .delete()
+      .eq('id', selectedProfile.id);
+
+    if (error) {
+      console.error('Error deleting profile:', error);
+      return;
+    }
+
+    const updated = profiles.filter((p) => p.id !== selectedProfile.id);
+    setProfiles(updated);
+    setSelectedProfileId(updated[0]?.id ?? null);
+
+    if (updated.length === 0) {
+      const newId = await createProfile();
+      if (newId) setSelectedProfileId(newId);
+    }
+  };
+
+  const updateLocalProfile = <K extends keyof Profile>(
+    key: K,
+    value: Profile[K]
+  ) => {
+    if (!selectedProfile) return;
+
+    setProfiles((prev) =>
+      prev.map((p) =>
+        p.id === selectedProfile.id
+          ? {
+              ...p,
+              [key]: value,
+            }
+          : p
+      )
+    );
+  };
+
+  useEffect(() => {
+    if (!selectedProfile?.id) return;
+
+    const timeout = setTimeout(async () => {
+      setSaving(true);
+
+      const { error } = await supabase
+        .from('profiles')
+        .update({
+          name: selectedProfile.name,
+          age: selectedProfile.age,
+          height: selectedProfile.height,
+          bodyweight: selectedProfile.bodyweight,
+          best_bench: selectedProfile.best_bench,
+          set_weight: selectedProfile.set_weight,
+          reps: selectedProfile.reps,
+          rpe: selectedProfile.rpe,
+          goal: selectedProfile.goal,
+          bench_days: selectedProfile.bench_days,
+          grip: selectedProfile.grip,
+          sticking_point: selectedProfile.sticking_point,
+        })
+        .eq('id', selectedProfile.id);
+
+      if (error) {
+        console.error('Error saving profile:', error);
+      }
+
+      setSaving(false);
+    }, 700);
+
+    return () => clearTimeout(timeout);
+  }, [
+    selectedProfile?.id,
+    selectedProfile?.name,
+    selectedProfile?.age,
+    selectedProfile?.height,
+    selectedProfile?.bodyweight,
+    selectedProfile?.best_bench,
+    selectedProfile?.set_weight,
+    selectedProfile?.reps,
+    selectedProfile?.rpe,
+    selectedProfile?.goal,
+    selectedProfile?.bench_days,
+    selectedProfile?.grip,
+    selectedProfile?.sticking_point,
+  ]);
+
+  if (loading) {
+    return (
+      <div style={styles.centerWrap}>
+        <div style={styles.card}>
+          <h1 style={styles.title}>Strength Systems</h1>
+          <p style={styles.subtitle}>Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return (
+      <div style={styles.centerWrap}>
+        <div style={{ ...styles.card, maxWidth: 460, textAlign: 'center' }}>
+          <div style={styles.logo}>🏋️</div>
+          <h1 style={styles.title}>Strength Systems</h1>
+          <p style={styles.subtitle}>Bench AI Coach</p>
+
+          <div style={styles.heroBox}>
+            <p style={styles.heroText}>
+              Track your bench, analyse your strength, and build better pressing
+              performance.
+            </p>
+          </div>
+
+          <button style={styles.googleButton} onClick={signInWithGoogle}>
+            Continue with Google
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (
-    <div
-      style={{
-        minHeight: '100vh',
-        background: '#f8fafc',
-        color: '#0f172a',
-        fontFamily: 'Arial, sans-serif',
-        padding: 24,
-      }}
-    >
-      <div style={{ maxWidth: 1150, margin: '0 auto' }}>
-        <h1 style={{ fontSize: 40, marginBottom: 8 }}>Bench AI Coach</h1>
-        <p style={{ color: '#475569', marginBottom: 24 }}>
-          Save profiles and switch between different people.
-        </p>
+    <div style={styles.app}>
+      <header style={styles.header}>
+        <div>
+          <h1 style={styles.headerTitle}>Strength Systems</h1>
+          <p style={styles.headerSubtitle}>Bench AI Coach</p>
+        </div>
 
-        <div
-          style={{
-            background: '#fff',
-            borderRadius: 20,
-            padding: 20,
-            boxShadow: '0 8px 24px rgba(0,0,0,0.06)',
-            marginBottom: 24,
-          }}
-        >
-          <h2 style={{ marginTop: 0 }}>Profiles</h2>
+        <div style={styles.headerRight}>
+          <span style={styles.userText}>{session.user.email}</span>
+          <button style={styles.secondaryButton} onClick={signOut}>
+            Sign Out
+          </button>
+        </div>
+      </header>
 
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
-            <select
-              value={activeProfileId}
-              onChange={(e) => setActiveProfileId(e.target.value)}
-              style={selectStyle}
-            >
-              {profiles.map((profile) => (
-                <option key={profile.id} value={profile.id}>
-                  {profile.name}
-                </option>
-              ))}
-            </select>
-
-            <button onClick={saveNewProfile} style={buttonStyle}>
-              New Profile
+      <div style={styles.layout}>
+        <aside style={styles.sidebar}>
+          <div style={styles.sidebarTop}>
+            <h2 style={styles.sectionTitle}>Profiles</h2>
+            <button style={styles.primaryButton} onClick={createProfile}>
+              + New
             </button>
-            <button onClick={duplicateProfile} style={buttonStyle}>
+          </div>
+
+          <div style={styles.profileList}>
+            {profiles.map((profile) => (
+              <button
+                key={profile.id}
+                onClick={() => setSelectedProfileId(profile.id)}
+                style={{
+                  ...styles.profileButton,
+                  ...(selectedProfileId === profile.id
+                    ? styles.profileButtonActive
+                    : {}),
+                }}
+              >
+                <div style={styles.profileName}>{profile.name || 'Unnamed'}</div>
+                <div style={styles.profileMeta}>
+                  BW {profile.bodyweight ?? '-'}kg · Bench {profile.best_bench ?? '-'}kg
+                </div>
+              </button>
+            ))}
+          </div>
+
+          <div style={styles.sidebarActions}>
+            <button style={styles.secondaryButtonFull} onClick={duplicateProfile}>
               Duplicate
             </button>
-            <button onClick={deleteProfile} style={deleteButtonStyle}>
+            <button style={styles.deleteButton} onClick={deleteProfile}>
               Delete
             </button>
           </div>
+        </aside>
 
-          <div style={{ color: '#475569', fontSize: 14 }}>
-            Profiles are saved automatically in your browser.
-          </div>
-        </div>
+        <main style={styles.main}>
+          {selectedProfile && (
+            <>
+              <section style={styles.cardSection}>
+                <div style={styles.sectionHeader}>
+                  <h2 style={styles.sectionTitle}>Profile Details</h2>
+                  <span style={styles.saveText}>{saving ? 'Saving...' : 'Saved'}</span>
+                </div>
 
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: '1fr 1.2fr',
-            gap: 24,
-          }}
-        >
-          <div
-            style={{
-              background: '#fff',
-              borderRadius: 20,
-              padding: 20,
-              boxShadow: '0 8px 24px rgba(0,0,0,0.06)',
-            }}
-          >
-            <h2 style={{ marginTop: 0 }}>Person</h2>
+                <div style={styles.grid}>
+                  <InputField
+                    label="Name"
+                    value={selectedProfile.name ?? ''}
+                    onChange={(value) => updateLocalProfile('name', value)}
+                  />
+                  <NumberField
+                    label="Age"
+                    value={selectedProfile.age}
+                    onChange={(value) => updateLocalProfile('age', value)}
+                  />
+                  <NumberField
+                    label="Height (cm)"
+                    value={selectedProfile.height}
+                    onChange={(value) => updateLocalProfile('height', value)}
+                  />
+                  <NumberField
+                    label="Bodyweight (kg)"
+                    value={selectedProfile.bodyweight}
+                    onChange={(value) => updateLocalProfile('bodyweight', value)}
+                  />
+                  <NumberField
+                    label="Best Bench (kg)"
+                    value={selectedProfile.best_bench}
+                    onChange={(value) => updateLocalProfile('best_bench', value)}
+                  />
+                  <NumberField
+                    label="Working Weight (kg)"
+                    value={selectedProfile.set_weight}
+                    onChange={(value) => updateLocalProfile('set_weight', value)}
+                  />
+                  <NumberField
+                    label="Reps"
+                    value={selectedProfile.reps}
+                    onChange={(value) => updateLocalProfile('reps', value)}
+                  />
+                  <NumberField
+                    label="RPE"
+                    value={selectedProfile.rpe}
+                    step="0.5"
+                    onChange={(value) => updateLocalProfile('rpe', value)}
+                  />
+                  <NumberField
+                    label="Goal Bench (kg)"
+                    value={selectedProfile.goal}
+                    onChange={(value) => updateLocalProfile('goal', value)}
+                  />
+                  <NumberField
+                    label="Bench Days / Week"
+                    value={selectedProfile.bench_days}
+                    onChange={(value) => updateLocalProfile('bench_days', value)}
+                  />
+                  <SelectField
+                    label="Grip"
+                    value={selectedProfile.grip ?? 'Medium'}
+                    options={['Close', 'Medium', 'Wide']}
+                    onChange={(value) => updateLocalProfile('grip', value)}
+                  />
+                  <SelectField
+                    label="Sticking Point"
+                    value={selectedProfile.sticking_point ?? 'Off Chest'}
+                    options={['Off Chest', 'Mid Range', 'Lockout']}
+                    onChange={(value) => updateLocalProfile('sticking_point', value)}
+                  />
+                </div>
+              </section>
 
-            <TextInput label="Name" value={activeProfile.name} onChange={(v) => updateProfile('name', v)} />
-            <NumberInput label="Age" value={activeProfile.age} onChange={(v) => updateProfile('age', v)} />
-            <NumberInput label="Height (cm)" value={activeProfile.height} onChange={(v) => updateProfile('height', v)} />
-            <NumberInput label="Bodyweight (kg)" value={activeProfile.bodyweight} onChange={(v) => updateProfile('bodyweight', v)} />
+              <section style={styles.statsGrid}>
+                <StatCard title="Estimated 1RM" value={`${oneRM} kg`} />
+                <StatCard title="Strength Level" value={strengthLevel} />
+                <StatCard title="BW Ratio" value={`${bodyweightRatio}x`} />
+                <StatCard title="Goal Progress" value={`${goalPercent}%`} />
+              </section>
 
-            <h2>Bench Data</h2>
+              <section style={styles.cardSection}>
+                <h2 style={styles.sectionTitle}>Bench Analysis</h2>
+                <div style={styles.analysisBox}>
+                  <p>
+                    <strong>Weak Point Insight:</strong>{' '}
+                    {getWeakPoint(selectedProfile.sticking_point)}
+                  </p>
+                  <p>
+                    <strong>Grip Style:</strong> {selectedProfile.grip ?? 'N/A'}
+                  </p>
+                  <p>
+                    <strong>Training Recommendation:</strong>{' '}
+                    {Number(selectedProfile.rpe ?? 0) >= 9
+                      ? 'Your RPE is high. Reduce fatigue slightly and focus on cleaner top sets.'
+                      : 'Your RPE is manageable. Keep building volume and progress load steadily.'}
+                  </p>
+                </div>
+              </section>
 
-            <NumberInput label="Best Bench (kg)" value={activeProfile.bestBench} onChange={(v) => updateProfile('bestBench', v)} />
-            <NumberInput label="Recent Set Weight (kg)" value={activeProfile.setWeight} onChange={(v) => updateProfile('setWeight', v)} />
-            <NumberInput label="Recent Set Reps" value={activeProfile.reps} onChange={(v) => updateProfile('reps', v)} />
-            <NumberInput label="Recent Set RPE" value={activeProfile.rpe} onChange={(v) => updateProfile('rpe', v)} />
-            <NumberInput label="Goal Bench (kg)" value={activeProfile.goal} onChange={(v) => updateProfile('goal', v)} />
-            <NumberInput label="Bench Days / Week" value={activeProfile.benchDays} onChange={(v) => updateProfile('benchDays', v)} />
-
-            <div style={{ marginBottom: 16 }}>
-              <label style={{ display: 'block', fontWeight: 700, marginBottom: 8 }}>Grip</label>
-              <select
-                value={activeProfile.grip}
-                onChange={(e) => updateProfile('grip', e.target.value)}
-                style={selectStyle}
-              >
-                <option value="wide">Wide</option>
-                <option value="medium">Medium</option>
-                <option value="close">Close</option>
-              </select>
-            </div>
-
-            <div style={{ marginBottom: 8 }}>
-              <label style={{ display: 'block', fontWeight: 700, marginBottom: 8 }}>
-                Sticking Point
-              </label>
-              <select
-                value={activeProfile.stickingPoint}
-                onChange={(e) => updateProfile('stickingPoint', e.target.value)}
-                style={selectStyle}
-              >
-                <option value="off_chest">Off chest</option>
-                <option value="mid_range">Mid-range</option>
-                <option value="lockout">Lockout</option>
-              </select>
-            </div>
-          </div>
-
-          <div style={{ display: 'grid', gap: 20 }}>
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(4, 1fr)',
-                gap: 16,
-              }}
-            >
-              <StatCard title="Modelled 1RM" value={`${analysis.chosenMax} kg`} />
-              <StatCard title="Strength Level" value={analysis.level} />
-              <StatCard title="BW Ratio" value={`${analysis.ratio}x`} />
-              <StatCard title="Goal Gap" value={`${analysis.goalGap} kg`} />
-            </div>
-
-            <div
-              style={{
-                background: '#fff',
-                borderRadius: 20,
-                padding: 20,
-                boxShadow: '0 8px 24px rgba(0,0,0,0.06)',
-              }}
-            >
-              <h2 style={{ marginTop: 0 }}>Profile Summary</h2>
-              <p><strong>Name:</strong> {activeProfile.name}</p>
-              <p><strong>Age:</strong> {activeProfile.age}</p>
-              <p><strong>Height:</strong> {activeProfile.height} cm</p>
-              <p><strong>Bodyweight:</strong> {activeProfile.bodyweight} kg</p>
-            </div>
-
-            <div
-              style={{
-                background: '#fff',
-                borderRadius: 20,
-                padding: 20,
-                boxShadow: '0 8px 24px rgba(0,0,0,0.06)',
-              }}
-            >
-              <h2 style={{ marginTop: 0 }}>Feedback</h2>
-              <p>
-                Estimated max from recent set: <strong>{roundTo(analysis.e1rm)} kg</strong>
-              </p>
-              <p>
-                {activeProfile.name}'s current working max is about <strong>{analysis.chosenMax} kg</strong>.
-              </p>
-              <p>
-                Strength level: <strong>{analysis.level}</strong>
-              </p>
-              <p>
-                Goal realism score: <strong>{analysis.realism}%</strong>
-              </p>
-              <p>{analysis.gripFeedback}</p>
-              <p>{analysis.mainFeedback}</p>
-            </div>
-
-            <div
-              style={{
-                background: '#fff',
-                borderRadius: 20,
-                padding: 20,
-                boxShadow: '0 8px 24px rgba(0,0,0,0.06)',
-              }}
-            >
-              <h2 style={{ marginTop: 0 }}>3-Week Peak</h2>
-              {analysis.program.map((week) => (
-                <div key={week.week} style={{ marginBottom: 18 }}>
-                  <h3 style={{ marginBottom: 8 }}>{week.week}</h3>
-                  {week.lines.map((line) => (
-                    <div key={line} style={{ color: '#334155', marginBottom: 6 }}>
-                      • {line}
+              <section style={styles.cardSection}>
+                <h2 style={styles.sectionTitle}>3-Week Peaking Program</h2>
+                <div style={styles.programGrid}>
+                  {program.map((week) => (
+                    <div key={week.week} style={styles.programCard}>
+                      <h3 style={styles.programTitle}>{week.week}</h3>
+                      <p><strong>Day 1:</strong> {week.day1}</p>
+                      <p><strong>Day 2:</strong> {week.day2}</p>
                     </div>
                   ))}
                 </div>
-              ))}
-            </div>
-          </div>
-        </div>
+              </section>
+            </>
+          )}
+        </main>
       </div>
     </div>
   );
 }
 
-function NumberInput({
-  label,
-  value,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  onChange: (value: number) => void;
-}) {
+function StatCard({ title, value }: { title: string; value: string }) {
   return (
-    <div style={{ marginBottom: 16 }}>
-      <label style={{ display: 'block', fontWeight: 700, marginBottom: 8 }}>{label}</label>
-      <input
-        type="number"
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        style={{
-          width: '100%',
-          padding: 12,
-          borderRadius: 12,
-          border: '1px solid #cbd5e1',
-          fontSize: 16,
-          boxSizing: 'border-box',
-        }}
-      />
+    <div style={styles.statCard}>
+      <div style={styles.statTitle}>{title}</div>
+      <div style={styles.statValue}>{value}</div>
     </div>
   );
 }
 
-function TextInput({
+function InputField({
   label,
   value,
   onChange,
@@ -452,66 +604,346 @@ function TextInput({
   onChange: (value: string) => void;
 }) {
   return (
-    <div style={{ marginBottom: 16 }}>
-      <label style={{ display: 'block', fontWeight: 700, marginBottom: 8 }}>{label}</label>
+    <label style={styles.field}>
+      <span style={styles.label}>{label}</span>
       <input
-        type="text"
+        style={styles.input}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        style={{
-          width: '100%',
-          padding: 12,
-          borderRadius: 12,
-          border: '1px solid #cbd5e1',
-          fontSize: 16,
-          boxSizing: 'border-box',
-        }}
       />
-    </div>
+    </label>
   );
 }
 
-function StatCard({ title, value }: { title: string; value: string }) {
+function NumberField({
+  label,
+  value,
+  onChange,
+  step = '1',
+}: {
+  label: string;
+  value: number | null;
+  onChange: (value: number | null) => void;
+  step?: string;
+}) {
   return (
-    <div
-      style={{
-        background: '#fff',
-        borderRadius: 18,
-        padding: 18,
-        boxShadow: '0 8px 24px rgba(0,0,0,0.06)',
-      }}
-    >
-      <div style={{ fontSize: 13, color: '#64748b', marginBottom: 8 }}>{title}</div>
-      <div style={{ fontSize: 28, fontWeight: 800 }}>{value}</div>
-    </div>
+    <label style={styles.field}>
+      <span style={styles.label}>{label}</span>
+      <input
+        style={styles.input}
+        type="number"
+        step={step}
+        value={value ?? ''}
+        onChange={(e) =>
+          onChange(e.target.value === '' ? null : Number(e.target.value))
+        }
+      />
+    </label>
   );
 }
 
-const selectStyle: React.CSSProperties = {
-  minWidth: 220,
-  padding: 12,
-  borderRadius: 12,
-  border: '1px solid #cbd5e1',
-  fontSize: 16,
-  boxSizing: 'border-box',
+function SelectField({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label style={styles.field}>
+      <span style={styles.label}>{label}</span>
+      <select
+        style={styles.input}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+const styles: Record<string, React.CSSProperties> = {
+  app: {
+    minHeight: '100vh',
+    background:
+      'linear-gradient(135deg, #0f172a 0%, #111827 40%, #1e293b 100%)',
+    color: 'white',
+    fontFamily:
+      'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif',
+    padding: '24px',
+  },
+  centerWrap: {
+    minHeight: '100vh',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background:
+      'linear-gradient(135deg, #0f172a 0%, #111827 40%, #1e293b 100%)',
+    padding: '24px',
+  },
+  card: {
+    width: '100%',
+    background: 'rgba(255,255,255,0.08)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    borderRadius: '22px',
+    padding: '32px',
+    boxShadow: '0 20px 50px rgba(0,0,0,0.35)',
+    backdropFilter: 'blur(10px)',
+  },
+  logo: {
+    fontSize: '52px',
+    marginBottom: '12px',
+  },
+  title: {
+    fontSize: '36px',
+    fontWeight: 800,
+    margin: 0,
+  },
+  subtitle: {
+    marginTop: '8px',
+    color: '#cbd5e1',
+    fontSize: '16px',
+  },
+  heroBox: {
+    marginTop: '24px',
+    marginBottom: '24px',
+    background: 'rgba(255,255,255,0.06)',
+    borderRadius: '16px',
+    padding: '18px',
+  },
+  heroText: {
+    margin: 0,
+    color: '#e2e8f0',
+    lineHeight: 1.6,
+  },
+  googleButton: {
+    width: '100%',
+    padding: '14px 18px',
+    borderRadius: '14px',
+    border: 'none',
+    background: 'white',
+    color: '#111827',
+    fontWeight: 700,
+    fontSize: '15px',
+    cursor: 'pointer',
+  },
+  header: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: '16px',
+    marginBottom: '24px',
+    flexWrap: 'wrap',
+  },
+  headerTitle: {
+    margin: 0,
+    fontSize: '28px',
+    fontWeight: 800,
+  },
+  headerSubtitle: {
+    margin: '4px 0 0 0',
+    color: '#cbd5e1',
+  },
+  headerRight: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px',
+    flexWrap: 'wrap',
+  },
+  userText: {
+    color: '#cbd5e1',
+    fontSize: '14px',
+  },
+  layout: {
+    display: 'grid',
+    gridTemplateColumns: '300px 1fr',
+    gap: '24px',
+  },
+  sidebar: {
+    background: 'rgba(255,255,255,0.07)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    borderRadius: '22px',
+    padding: '18px',
+    height: 'fit-content',
+  },
+  sidebarTop: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '16px',
+  },
+  profileList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px',
+  },
+  profileButton: {
+    textAlign: 'left',
+    padding: '14px',
+    borderRadius: '14px',
+    border: '1px solid rgba(255,255,255,0.08)',
+    background: 'rgba(255,255,255,0.04)',
+    color: 'white',
+    cursor: 'pointer',
+  },
+  profileButtonActive: {
+    background: 'rgba(59,130,246,0.28)',
+    border: '1px solid rgba(96,165,250,0.55)',
+  },
+  profileName: {
+    fontWeight: 700,
+    marginBottom: '4px',
+  },
+  profileMeta: {
+    fontSize: '13px',
+    color: '#cbd5e1',
+  },
+  sidebarActions: {
+    marginTop: '16px',
+    display: 'grid',
+    gap: '10px',
+  },
+  main: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '20px',
+  },
+  cardSection: {
+    background: 'rgba(255,255,255,0.07)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    borderRadius: '22px',
+    padding: '22px',
+  },
+  sectionHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: '12px',
+    marginBottom: '18px',
+    flexWrap: 'wrap',
+  },
+  sectionTitle: {
+    margin: 0,
+    fontSize: '20px',
+    fontWeight: 800,
+  },
+  saveText: {
+    color: '#93c5fd',
+    fontSize: '14px',
+  },
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+    gap: '14px',
+  },
+  field: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  },
+  label: {
+    fontSize: '13px',
+    color: '#cbd5e1',
+    fontWeight: 600,
+  },
+  input: {
+    borderRadius: '12px',
+    border: '1px solid rgba(255,255,255,0.12)',
+    background: 'rgba(255,255,255,0.06)',
+    color: 'white',
+    padding: '12px 14px',
+    outline: 'none',
+  },
+  statsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+    gap: '16px',
+  },
+  statCard: {
+    background: 'rgba(255,255,255,0.07)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    borderRadius: '22px',
+    padding: '20px',
+  },
+  statTitle: {
+    color: '#cbd5e1',
+    fontSize: '14px',
+    marginBottom: '8px',
+  },
+  statValue: {
+    fontSize: '28px',
+    fontWeight: 800,
+  },
+  analysisBox: {
+    background: 'rgba(255,255,255,0.04)',
+    borderRadius: '16px',
+    padding: '18px',
+    lineHeight: 1.7,
+    color: '#e2e8f0',
+  },
+  programGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+    gap: '16px',
+  },
+  programCard: {
+    background: 'rgba(255,255,255,0.05)',
+    border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: '18px',
+    padding: '18px',
+  },
+  programTitle: {
+    marginTop: 0,
+    marginBottom: '12px',
+    fontSize: '18px',
+  },
+  primaryButton: {
+    padding: '10px 14px',
+    borderRadius: '12px',
+    border: 'none',
+    background: '#2563eb',
+    color: 'white',
+    fontWeight: 700,
+    cursor: 'pointer',
+  },
+  secondaryButton: {
+    padding: '10px 14px',
+    borderRadius: '12px',
+    border: '1px solid rgba(255,255,255,0.14)',
+    background: 'rgba(255,255,255,0.06)',
+    color: 'white',
+    fontWeight: 700,
+    cursor: 'pointer',
+  },
+  secondaryButtonFull: {
+    width: '100%',
+    padding: '12px 14px',
+    borderRadius: '12px',
+    border: '1px solid rgba(255,255,255,0.14)',
+    background: 'rgba(255,255,255,0.06)',
+    color: 'white',
+    fontWeight: 700,
+    cursor: 'pointer',
+  },
+  deleteButton: {
+    width: '100%',
+    padding: '12px 14px',
+    borderRadius: '12px',
+    border: 'none',
+    background: '#dc2626',
+    color: 'white',
+    fontWeight: 700,
+    cursor: 'pointer',
+  },
 };
 
-const buttonStyle: React.CSSProperties = {
-  padding: '12px 16px',
-  borderRadius: 12,
-  border: 'none',
-  background: '#0f172a',
-  color: '#fff',
-  fontWeight: 700,
-  cursor: 'pointer',
-};
-
-const deleteButtonStyle: React.CSSProperties = {
-  padding: '12px 16px',
-  borderRadius: 12,
-  border: 'none',
-  background: '#b91c1c',
-  color: '#fff',
-  fontWeight: 700,
-  cursor: 'pointer',
-};
+export default App;
