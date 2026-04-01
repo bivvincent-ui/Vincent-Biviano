@@ -19,17 +19,17 @@ type Profile = {
   created_at?: string;
 };
 
-const emptyProfile = {
+const emptyProfile: any = {
   name: "",
-  age: null,
-  height: null,
-  bodyweight: null,
-  best_bench: null,
-  set_weight: null,
-  reps: null,
-  rpe: null,
-  goal: null,
-  bench_days: null,
+  age: "",
+  height: "",
+  bodyweight: "",
+  best_bench: "",
+  set_weight: "",
+  reps: "",
+  rpe: "",
+  goal: "",
+  bench_days: "",
   grip: "",
   sticking_point: "",
 };
@@ -39,7 +39,7 @@ function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [selectedProfile, setSelectedProfile] = useState<Profile | null>(null);
   const [showForm, setShowForm] = useState(false);
-  const [formData, setFormData] = useState(emptyProfile);
+  const [formData, setFormData] = useState<any>(emptyProfile);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -187,7 +187,7 @@ function App() {
       "bench_days",
     ];
 
-    setFormData((prev) => ({
+    setFormData((prev: any) => ({
       ...prev,
       [name]: numericFields.includes(name)
         ? value === ""
